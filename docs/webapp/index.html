@@ -308,8 +308,21 @@
       const deposit  = !isExpense ? fmtAmount(abs) : "-";
 
       const content = isExpense ? "支払い" : "チャージ";
-      const method  = isExpense ? "Suica" : "VIEWカード";
       const user    = isExpense ? "本人" : "-";
+
+      let method;
+      if (isExpense) {
+        method = "Suica";
+      } else {
+        const t1 = trimWide(type1); // 種別1で判定（全角スペース等を除去）
+        if (t1 === "現金") {
+          method = "財布";
+        } else if (t1 === "ｵｰﾄ") {
+          method = "VIEWカード";
+        } else {
+          method = "カード";
+        }
+      }
 
       outIndex++;
       const tradeNo = ymd + String(outIndex).padStart(4, "0") + randHex(4); // no hyphen
