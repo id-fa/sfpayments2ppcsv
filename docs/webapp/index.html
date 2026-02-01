@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>MobileSuica TSV → PayPay CSV for MoneyForward</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 16px; line-height: 1.5; }
+    textarea { width: 100%; min-height: 240px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin: 12px 0; }
+    button { padding: 10px 14px; cursor: pointer; }
+    .box { border: 1px solid #ddd; border-radius: 8px; padding: 12px; }
+    .muted { color: #666; font-size: 13px; }
+    .log { white-space: pre-wrap; background: #fafafa; padding: 10px; border-radius: 6px; border: 1px solid #eee; max-height: 200px; overflow: auto; }
+    label { display: inline-flex; gap: 8px; align-items: center; }
+    input[type="text"] { padding: 8px 10px; }
+    .warn { color: #b45309; }
+    .ok { color: #15803d; }
+    .downloads { margin-top: 10px; }
+    .downloads ul { margin: 0; padding-left: 18px; }
+    .downloads a { display: inline-block; margin: 4px 0; }
+    .pill { display:inline-block; padding:2px 8px; border:1px solid #ddd; border-radius:999px; font-size:12px; color:#555; margin-left:6px;}
+  </style>
+</head>
+<body>
+  <h1>MobileSuica Payments History → PayPay CSV</h1>
+
+  <div class="box">
+    <p class="muted">
+      <A href="https://www.mobilesuica.com/" target="_blank">モバイルSuicaのサイト</a>からSF利用履歴のテーブルをコピーして貼り付けて「変換」を押してください。<br>
+      年号は現在年を基準にし、<b>未来の日付</b>が出たら前年扱いにします。<br>
+      取引時刻が入っていないため、同一日で <b>10:00:00 から 1分ずつ減らしています</b>。
+    </p>
+
+    <textarea id="tsv" placeholder="ここにSuica利用履歴テーブルをペースト"></textarea>
+
+    <div class="row">
+      <label>
+        <input type="checkbox" id="expenseOnly">
+        支出のみ（マイナスだけ出力）
+      </label>
+
+      <label>
+        出力ベース名：
+        <input type="text" id="baseName" value="mf_suica.csv" />
+      </label>
+
+      <button id="btnConvert">変換（リンク生成）</button>
+      <button id="btnClear" type="button">クリア</button>
+    </div>
+
+    <div class="muted">
+      分割ルール：1ファイル最大 <b>100行（ヘッダ含む）</b>。超えたら <code>_001</code>, <code>_002</code>… で分割します。<br>
+      出力は自動ダウンロードせず、下にダウンロードリンクを作成します（手動クリックで保存）。
+    </div>
+  </div>
+
+  <h2>ダウンロード</h2>
+  <div id="downloads" class="downloads box muted">まだ生成されていません。</div>
+
+  <h2>ログ</h2>
+  <div id="log" class="log"></div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+
+  const MAX_LINES_PER_FILE = 100; // header included
+  const FIXED_START_TIME = { h: 10, m: 0, s: 0 }; // 10:00:00 start
+
+  let activeObjectUrls = [];
+
+  function log(msg, cls="") {
+    const el = $("log");
+    const line = document.createElement("div");
+    if (cls) line.className = cls;
+    line.textContent = msg;
+    el.appendChild(line);
+    el.scrollTop = el.scrollHeight;
+  }
+  function clearLog() { $("log").textContent = ""; }
+
+  function clearDownloads() {
+    // revoke old urls
+    for (const u of activeObjectUrls) URL.revokeObjectURL(u);
+    activeObjectUrls = [];
+    const box = $("downloads");
+    box.textContent = "まだ生成されていません。";
+  }
+
+  // CSV: minimal quoting
+  function csvEscape(field) {
+    const s = String(field ?? "");
+    const needQuote = s.includes(",") || s.includes('"') || s.includes("\n") || s.includes("\r");
+    if (!needQuote) return s;
+    return '"' + s.replaceAll('"', '""') + '"';
+  }
+  function toCsvLine(fields) {
+    return fields.map(csvEscape).join(",") + "\r\n";
+  }
+
+  // Amount formatting rule: 4+ digits -> comma grouping (quoted by CSV rule)
+  function fmtAmount(n) {
+    if (n >= 1000) return n.toLocaleString("en-US"); // "1,234"
+    return String(n);
+  }
+
+  function parseAmount(raw) {
+    if (raw == null) return null;
+    let s = String(raw).trim();
+    if (!s) return null;
+    s = s.replaceAll("\\", "").replaceAll("￥", "").replaceAll(",", "").replaceAll(" ", "");
+    if (!/^[+-]?\d+$/.test(s)) return null;
+    const v = Number(s);
+    if (!Number.isFinite(v)) return null;
+    return v | 0;
+  }
+
+  function trimWide(s) {
+    return String(s ?? "").replace(/^[\s\u3000]+|[\s\u3000]+$/g, "");
+  }
+
+  function buildPayee(tokens) {
+    const clean = [];
+    for (const t of tokens) {
+      const v = trimWide(t);
+      if (v) clean.push(v);
+    }
+    return clean.join(" ");
+  }
+
+  // Year rule: current year, but if month/day would be in the future -> previous year
+  function resolveYearForMonthDay(mm, dd) {
+    const now = new Date();
+    const currentYear = now.getFullYear();
+    const candidate = new Date(currentYear, mm - 1, dd, 0, 0, 0);
+    const today0 = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
+    return (candidate.getTime() > today0.getTime()) ? (currentYear - 1) : currentYear;
+  }
+
+  // Same-day: 10:00:00 start, then -N minutes (decrease)
+  function makeTradeDateTime(year, mm, dd, offsetMinutes) {
+    const dt = new Date(year, mm - 1, dd, FIXED_START_TIME.h, FIXED_START_TIME.m, FIXED_START_TIME.s);
+    dt.setMinutes(dt.getMinutes() - offsetMinutes); // decrease; auto carry to hours/days if needed
+    const Y = dt.getFullYear();
+    const M = String(dt.getMonth() + 1).padStart(2, "0");
+    const D = String(dt.getDate()).padStart(2, "0");
+    const hh = String(dt.getHours()).padStart(2, "0");
+    const mi = String(dt.getMinutes()).padStart(2, "0");
+    const ss = String(dt.getSeconds()).padStart(2, "0");
+    return `${Y}/${M}/${D} ${hh}:${mi}:${ss}`;
+  }
+
+  function randHex(lenBytes) {
+    const a = new Uint8Array(lenBytes);
+    crypto.getRandomValues(a);
+    return [...a].map(b => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  function normalizeBaseName(name) {
+    let n = String(name || "mf_suica.csv").trim();
+    if (!n) n = "mf_suica.csv";
+    n = n.replace(/[\/\\]/g, "_");
+    return n;
+  }
+
+  function splitName(name) {
+    const idx = name.lastIndexOf(".");
+    if (idx === -1) return { stem: name, ext: "" };
+    return { stem: name.slice(0, idx), ext: name.slice(idx) };
+  }
+
+  function renderDownloadLinks(files, baseName) {
+    const box = $("downloads");
+    box.innerHTML = "";
+
+    const { stem, ext } = splitName(baseName);
+
+    const p = document.createElement("div");
+    p.className = "muted";
+    p.textContent = `生成完了：${files.length}ファイル（クリックして保存）`;
+    box.appendChild(p);
+
+    const ul = document.createElement("ul");
+    for (let i = 0; i < files.length; i++) {
+      const seq = String(i + 1).padStart(3, "0");
+      const filename = `${stem}_${seq}${ext}`;
+
+      const blob = new Blob([files[i]], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      activeObjectUrls.push(url);
+
+      const li = document.createElement("li");
+
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.textContent = filename;
+
+      const size = document.createElement("span");
+      size.className = "pill";
+      size.textContent = `${Math.ceil(blob.size / 1024)} KB`;
+
+      li.appendChild(a);
+      li.appendChild(size);
+      ul.appendChild(li);
+    }
+    box.appendChild(ul);
+
+    const note = document.createElement("div");
+    note.className = "muted";
+    note.style.marginTop = "8px";
+    note.textContent = "※ 生成し直すと前回のリンクは無効になります（URLを破棄）。";
+    box.appendChild(note);
+  }
+
+  function convert() {
+    clearLog();
+    clearDownloads();
+
+    const tsvText = $("tsv").value;
+    if (!tsvText.trim()) {
+      log("TSVが空です。貼り付けてください。", "warn");
+      return;
+    }
+
+    const expenseOnly = $("expenseOnly").checked;
+    const baseName = normalizeBaseName($("baseName").value);
+
+    const header = [
+      "取引日",
+      "出金金額（円）",
+      "入金金額（円）",
+      "海外出金金額",
+      "通貨",
+      "変換レート（円）",
+      "利用国",
+      "取引内容",
+      "取引先",
+      "取引方法",
+      "支払い区分",
+      "利用者",
+      "取引番号",
+    ];
+
+    const normalized = tsvText.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+    const lines = normalized.split("\n").filter(l => l.trim() !== "");
+
+    if (lines.length <= 1) {
+      log("データ行が見つかりません（ヘッダのみ？）", "warn");
+      return;
+    }
+
+    // chunked files (string contents)
+    const files = [];
+    let currentLines = [];
+    let linesInFile = 0; // includes header
+
+    function openNewFile() {
+      currentLines = [];
+      currentLines.push("\uFEFF" + toCsvLine(header)); // BOM + header
+      linesInFile = 1;
+    }
+    function closeFile() {
+      if (currentLines.length === 0) return;
+      files.push(currentLines.join(""));
+      currentLines = [];
+      linesInFile = 0;
+    }
+
+    openNewFile();
+
+    const dayMinuteCounter = new Map(); // key: YYYYMMDD -> count (exported rows only)
+    let outIndex = 0;
+
+    for (let i = 1; i < lines.length; i++) {
+      const cols = lines[i].split("\t");
+      while (cols.length < 7) cols.push("");
+
+      const md = trimWide(cols[0]);
+      const type1 = cols[1], place1 = cols[2], type2 = cols[3], place2 = cols[4];
+      const amountRaw = cols[6];
+
+      const amount = parseAmount(amountRaw);
+      if (amount === null || amount === 0) continue;
+      if (expenseOnly && amount > 0) continue;
+
+      const m = md.match(/^(\d{1,2})\/(\d{1,2})$/);
+      if (!m) continue;
+
+      const mm = Number(m[1]);
+      const dd = Number(m[2]);
+      if (!(mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31)) continue;
+
+      const year = resolveYearForMonthDay(mm, dd);
+      const ymd = `${year}${String(mm).padStart(2,"0")}${String(dd).padStart(2,"0")}`;
+
+      const count = dayMinuteCounter.get(ymd) ?? 0;
+      dayMinuteCounter.set(ymd, count + 1);
+
+      const tradeDate = makeTradeDateTime(year, mm, dd, count);
+      const payee = buildPayee([type1, place1, type2, place2]);
+
+      const isExpense = amount < 0;
+      const abs = Math.abs(amount);
+
+      const withdraw = isExpense ? fmtAmount(abs) : "-";
+      const deposit  = !isExpense ? fmtAmount(abs) : "-";
+
+      const content = isExpense ? "支払い" : "チャージ";
+      const method  = isExpense ? "Suica" : "VIEWカード";
+      const user    = isExpense ? "本人" : "-";
+
+      outIndex++;
+      const tradeNo = ymd + String(outIndex).padStart(4, "0") + randHex(4); // no hyphen
+
+      const row = [
+        tradeDate,
+        withdraw,
+        deposit,
+        "-",
+        "-",
+        "-",
+        "-",
+        content,
+        payee,
+        method,
+        "-",
+        user,
+        tradeNo
+      ];
+
+      if (linesInFile + 1 > MAX_LINES_PER_FILE) {
+        closeFile();
+        openNewFile();
+      }
+
+      currentLines.push(toCsvLine(row));
+      linesInFile++;
+    }
+
+    closeFile();
+
+    if (files.length === 0) {
+      log("出力対象がありません（フィルタ等で全行スキップされた可能性）", "warn");
+      return;
+    }
+
+    log(`生成ファイル数: ${files.length}`, "ok");
+    renderDownloadLinks(files, baseName);
+    log("ダウンロード欄のリンクをクリックして保存してください。", "ok");
+  }
+
+  $("btnConvert").addEventListener("click", convert);
+  $("btnClear").addEventListener("click", () => {
+    $("tsv").value = "";
+    clearLog();
+    clearDownloads();
+  });
+
+  $("tsv").addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+      e.preventDefault();
+      convert();
+    }
+  });
+
+  clearLog();
+  clearDownloads();
+  log("準備OK。TSVを貼り付けて「変換（リンク生成）」を押してください。Ctrl+Enter でも変換できます。");
+})();
+</script>
+</body>
+</html>
