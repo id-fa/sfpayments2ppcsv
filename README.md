@@ -135,3 +135,8 @@ php moneyforward_convert.php --expense-only
 ## License
 
 MIT License
+
+## 関連
+
+[マネーフォワードMEにモバイルSuicaの履歴を取り込む - ふぁメモ](https://fa.hatenadiary.jp/entry/20260202/1769966190)
+
